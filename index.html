@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estudio de sonido del robot</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #f4f5f7; color: #1a1a1a; display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 720px; padding: 28px 20px 60px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 18px; }
+  .video-box {
+    width: 100%; aspect-ratio: 16/9; background: #222; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; color: #bbb;
+    overflow: hidden; margin-bottom: 22px; text-align: center; font-size: 14px;
+  }
+  .video-box video { width: 100%; height: 100%; object-fit: contain; background:#000; }
+  .pregunta { font-size: 17px; margin: 0 0 6px; }
+  .ayuda { font-size: 13px; color: #666; margin: 0 0 20px; }
+  .slider-row { margin: 10px 0 6px; }
+  input[type=range] { width: 100%; height: 36px; cursor: pointer; }
+  .extremos { display: flex; justify-content: space-between; font-size: 13px; color: #888; margin-bottom: 26px; }
+  button {
+    font-size: 16px; padding: 12px 28px; border: 0; border-radius: 8px;
+    background: #2b6cb0; color: #fff; cursor: pointer;
+  }
+  button:disabled { background: #a9b6c4; cursor: default; }
+  .estado { margin-top: 16px; color: #555; font-size: 14px; }
+  .fin { font-size: 18px; margin-top: 20px; }
+  .aviso { color: #b23; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Estudio de sonido del robot</h1>
+
+  <div class="video-box" id="videoBox">
+    <span id="videoPlaceholder">[ Aquí irá el vídeo del robot — define VIDEO_URL ]</span>
+  </div>
+
+  <p class="pregunta" id="pregunta"></p>
+  <p class="ayuda">Mantén pulsada la barra para oír el sonido; muévela para cambiarlo. Suelta para que pare.</p>
+
+  <div class="slider-row">
+    <input type="range" id="slider" min="0" max="1" step="0.001" value="0.5">
+  </div>
+  <div class="extremos"><span>ligero</span><span>pesado</span></div>
+
+  <button id="confirmar">Confirmar</button>
+  <div class="estado" id="estado"></div>
+  <div class="aviso" id="aviso"></div>
+</div>
+
+<script>
+/* ===================== CONFIGURACION (edita aqui) ===================== */
+
+// URL del vídeo del robot (mp4 accesible publicamente). Vacio = placeholder.
+const VIDEO_URL = "";
+
+// URL del Web App de Google Apps Script (termina en /exec). Vacio = no envia.
+const SHEET_ENDPOINT = "";
+
+// Texto de la pregunta.
+const PREGUNTA = "Ajusta el sonido hasta que sea el que mejor pega con este robot.";
+
+// Repeticiones por participante.
+const N_REPETICIONES = 3;
+
+// Extremos del slider: [f_lo, f_hi] en Hz. Orden del filtro fijo = 2 (biquad).
+const LIGERO = { f_lo: 3000, f_hi: 9000 };   // t = 0
+const PESADO = { f_lo: 40,   f_hi: 16000 };  // t = 1
+
+/* ===================================================================== */
+
+// ---- interpolacion lineal t -> (f_lo, f_hi) ----
+function interp(t) {
+  t = Math.min(Math.max(t, 0), 1);
+  return {
+    f_lo: LIGERO.f_lo + t * (PESADO.f_lo - LIGERO.f_lo),
+    f_hi: LIGERO.f_hi + t * (PESADO.f_hi - LIGERO.f_hi),
+  };
+}
+
+// ---- audio (Web Audio API): ruido rosa -> pasa-banda -> ganancia ----
+let ctx, source, filter, gain, limiter, started = false;
+const REF_BW = PESADO.f_hi - PESADO.f_lo;   // ancho de referencia para igualar volumen
+
+function pinkBuffer(ctx, seconds) {
+  const n = ctx.sampleRate * seconds;
+  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+  const out = buf.getChannelData(0);
+  let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+  for (let i=0; i<n; i++) {
+    const w = Math.random()*2-1;
+    b0=0.99886*b0+w*0.0555179; b1=0.99332*b1+w*0.0750759; b2=0.96900*b2+w*0.1538520;
+    b3=0.86650*b3+w*0.3104856; b4=0.55000*b4+w*0.5329522; b5=-0.7616*b5-w*0.0168980;
+    out[i]=(b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.11; b6=w*0.115926;
+  }
+  return buf;
+}
+
+function initAudio() {
+  if (started) return;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  source = ctx.createBufferSource();
+  source.buffer = pinkBuffer(ctx, 4);
+  source.loop = true;
+  filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  gain = ctx.createGain();
+  gain.gain.value = 0;                      // silencio hasta mantener pulsado
+  limiter = ctx.createDynamicsCompressor(); // seguridad anticlipping
+  source.connect(filter); filter.connect(gain); gain.connect(limiter); limiter.connect(ctx.destination);
+  source.start();
+  started = true;
+  aplicarT(parseFloat(slider.value));
+}
+
+// actualiza el filtro segun t (banda definida por f_lo y f_hi)
+function aplicarT(t) {
+  const { f_lo, f_hi } = interp(t);
+  const fc = Math.sqrt(f_lo * f_hi);        // centro geometrico de la banda
+  const bw = Math.max(f_hi - f_lo, 1);
+  if (filter) {
+    filter.frequency.value = fc;
+    filter.Q.value = fc / bw;               // Q equivalente a la banda
+    // volumen aprox. constante: compensa bandas estrechas (suenan mas flojas)
+    const makeup = Math.min(Math.sqrt(REF_BW / bw), 4);
+    gain._target = 0.25 * makeup;           // nivel objetivo mientras suena
+    if (gain.gain.value > 0.001) gain.gain.setTargetAtTime(gain._target, ctx.currentTime, 0.01);
+  }
+}
+
+function sonar(on) {
+  if (!ctx) return;
+  const v = on ? (gain._target || 0.25) : 0;
+  gain.gain.setTargetAtTime(v, ctx.currentTime, on ? 0.01 : 0.03);
+}
+
+// ---- estado del estudio ----
+const slider = document.getElementById("slider");
+const estado = document.getElementById("estado");
+const aviso = document.getElementById("aviso");
+const btn = document.getElementById("confirmar");
+document.getElementById("pregunta").textContent = PREGUNTA;
+
+const participante = "P_" + new Date().toISOString().replace(/[-:.TZ]/g,"").slice(0,14)
+                   + "_" + Math.floor(Math.random()*1000);
+let rep = 0;
+const reps = [];   // {t, f_lo, f_hi}
+
+function nuevaRep() {
+  rep++;
+  const inicio = Math.random();          // posicion aleatoria del slider
+  slider.value = inicio;
+  aplicarT(inicio);
+  estado.textContent = "Repeticion " + rep + " de " + N_REPETICIONES;
+}
+
+// mantener pulsado = suena; soltar = calla
+slider.addEventListener("pointerdown", () => { initAudio(); if(ctx.state==="suspended") ctx.resume(); aplicarT(parseFloat(slider.value)); sonar(true); });
+slider.addEventListener("pointerup",   () => sonar(false));
+slider.addEventListener("pointerleave",() => sonar(false));
+slider.addEventListener("input",       () => aplicarT(parseFloat(slider.value)));
+
+btn.addEventListener("click", () => {
+  const t = parseFloat(slider.value);
+  const { f_lo, f_hi } = interp(t);
+  reps.push({ t, f_lo, f_hi });
+  if (rep >= N_REPETICIONES) { finalizar(); } else { nuevaRep(); }
+});
+
+function media(a){ return a.reduce((s,x)=>s+x,0)/a.length; }
+function desv(a){ if(a.length<2) return 0; const m=media(a); return Math.sqrt(a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1)); }
+
+function finalizar() {
+  sonar(false);
+  const ts = reps.map(r=>r.t), flos = reps.map(r=>r.f_lo), fhis = reps.map(r=>r.f_hi);
+  const payload = {
+    participante,
+    t1: +ts[0].toFixed(4), t2: +ts[1].toFixed(4), t3: +ts[2].toFixed(4),
+    t_media: +media(ts).toFixed(4), t_desv: +desv(ts).toFixed(4),
+    flo_media: +media(flos).toFixed(2), fhi_media: +media(fhis).toFixed(2),
+    fecha: new Date().toISOString(),
+  };
+  if (SHEET_ENDPOINT) {
+    fetch(SHEET_ENDPOINT, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload),
+    }).catch(()=>{});
+  } else {
+    aviso.textContent = "SHEET_ENDPOINT vacio: la respuesta NO se ha guardado (modo prueba).";
+  }
+  slider.disabled = true; btn.disabled = true;
+  estado.innerHTML = "<div class='fin'>Gracias. Ya puedes cerrar la ventana.</div>";
+}
+
+// ---- video ----
+if (VIDEO_URL) {
+  const box = document.getElementById("videoBox");
+  box.innerHTML = "";
+  const v = document.createElement("video");
+  v.src = VIDEO_URL; v.muted = true; v.loop = true; v.autoplay = true;
+  v.playsInline = true; v.setAttribute("playsinline","");
+  box.appendChild(v);
+}
+
+nuevaRep();
+</script>
+</body>
+</html>
