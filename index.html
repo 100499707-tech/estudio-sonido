@@ -183,6 +183,8 @@ function finalizar() {
   const payload = {
     participante,
     t1: +ts[0].toFixed(4), t2: +ts[1].toFixed(4), t3: +ts[2].toFixed(4),
+    flo1: +flos[0].toFixed(2), flo2: +flos[1].toFixed(2), flo3: +flos[2].toFixed(2),
+    fhi1: +fhis[0].toFixed(2), fhi2: +fhis[1].toFixed(2), fhi3: +fhis[2].toFixed(2),
     t_media: +media(ts).toFixed(4), t_desv: +desv(ts).toFixed(4),
     flo_media: +media(flos).toFixed(2), fhi_media: +media(fhis).toFixed(2),
     fecha: new Date().toISOString(),
